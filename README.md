@@ -1,4 +1,4 @@
-# URBAN5080P Dissertation
+# 3096654Z Jingkai Zhou Dissertation
 
 This repository contains the R code and processed datasets used for the MSc Urban Transport dissertation:
 
@@ -8,8 +8,9 @@ This repository contains the R code and processed datasets used for the MSc Urba
 
 The original data used in this dissertation are publicly available from the UK Department for Transport:
 
-- Department for Transport Road Traffic Statistics
-- STATS19 Road Safety Open Data
+- https://www.gov.uk/government/statistical-data-sets/road-safety-open-data
+- [STATS19 Collision Data] https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-collision-1979-latest-published-year.csv
+- [STATS19 Vehicle Data] https://data.dft.gov.uk/road-accidents-safety-data/dft-road-casualty-statistics-vehicle-1979-latest-published-year.csv
 
 The raw datasets are not duplicated in this repository because they are publicly available from the original sources.
 
