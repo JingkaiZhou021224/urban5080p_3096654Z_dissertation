@@ -1,0 +1,974 @@
+---
+title: "Light Goods Vehicles Share and Collision Involvement on Major Roads in Greater Manchester: Modelling Collision Frequency and Injury Severity, 2017–2024"
+author: "3096654Z_Jingkai Zhou"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+```{r load-packages}
+library(readr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(MASS)
+library(sandwich)
+```
+
+```{r set-paths}
+project_dir <- "E:/dissertation/output"
+data_dir <- "E:/dissertation/datasets"
+
+traffic_file <- file.path(data_dir, "dft_traffic_counts_aadf.csv")
+stats19_dir <- file.path(data_dir, "stats19_complete_official")
+collision_file <- file.path(
+  stats19_dir,
+  "dft-road-casualty-statistics-collision-1979-latest-published-year.csv"
+)
+vehicle_file <- file.path(
+  stats19_dir,
+  "dft-road-casualty-statistics-vehicle-1979-latest-published-year.csv"
+)
+
+clean_dir <- file.path(project_dir, "Cleaned data")
+analysis_dir <- file.path(project_dir, "Model analysis output")
+histogram_dir <- file.path(clean_dir, "histograms")
+figure_dir <- file.path(analysis_dir, "figures")
+
+dir.create(clean_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(analysis_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(histogram_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(figure_dir, showWarnings = FALSE, recursive = TRUE)
+
+years <- 2017:2024
+gm_local_authorities <- c(
+  "Bolton", "Bury", "Manchester", "Oldham", "Rochdale",
+  "Salford", "Stockport", "Tameside", "Trafford", "Wigan"
+)
+```
+
+```{r clean-traffic}
+traffic_raw <- read_csv(traffic_file, show_col_types = FALSE)
+
+traffic_clean <- traffic_raw %>%
+  mutate(
+    road_name = str_to_upper(road_name),
+    road_name = str_replace_all(road_name, "\\s+", ""),
+    road_type_simple = case_when(
+      str_detect(road_name, "^M") ~ "Motorway",
+      str_detect(road_name, "^A") ~ "A road",
+      TRUE ~ "Other"
+    ),
+    lgv_share = LGVs / all_motor_vehicles
+  ) %>%
+  filter(
+    year %in% years,
+    local_authority_name %in% gm_local_authorities,
+    road_type_simple %in% c("Motorway", "A road"),
+    !is.na(road_name),
+    !is.na(all_motor_vehicles),
+    all_motor_vehicles > 0
+  )
+
+write_csv(
+  traffic_clean,
+  file.path(clean_dir, "traffic_clean_gm_major_2017_2024.csv")
+)
+
+nrow(traffic_clean)
+
+rm(traffic_raw)
+invisible(gc())
+```
+
+```{r aggregate-traffic}
+road_length_data <- traffic_clean %>%
+  distinct(road_name, year, count_point_id, link_length_km) %>%
+  group_by(road_name, year) %>%
+  summarise(
+    road_length_km = sum(link_length_km, na.rm = TRUE),
+    count_points = n_distinct(count_point_id),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    road_length_km = if_else(road_length_km <= 0, NA_real_, road_length_km),
+    log_road_length = log(road_length_km)
+  )
+
+traffic_road_year <- traffic_clean %>%
+  group_by(road_name, year) %>%
+  summarise(
+    road_type = if_else(
+      any(road_type_simple == "Motorway"),
+      "Motorway",
+      "A road"
+    ),
+    all_motor_vehicles = mean(all_motor_vehicles, na.rm = TRUE),
+    LGVs = mean(LGVs, na.rm = TRUE),
+    all_HGVs = mean(all_HGVs, na.rm = TRUE),
+    cars_and_taxis = mean(cars_and_taxis, na.rm = TRUE),
+    lgv_share = mean(lgv_share, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(road_length_data, by = c("road_name", "year")) %>%
+  mutate(log_total_traffic = log(all_motor_vehicles))
+
+write_csv(
+  traffic_road_year,
+  file.path(clean_dir, "traffic_road_year_with_length.csv")
+)
+
+traffic_road_year %>%
+  summarise(
+    rows = n(),
+    missing_road_length = sum(is.na(road_length_km)),
+    mean_road_length_km = mean(road_length_km, na.rm = TRUE)
+  )
+```
+
+```{r clean-collisions}
+collisions_raw <- read_csv(
+  collision_file,
+  col_select = c(
+    collision_index,
+    collision_year,
+    collision_ref_no,
+    police_force,
+    collision_severity,
+    first_road_class,
+    first_road_number,
+    time,
+    speed_limit,
+    junction_detail
+  ),
+  col_types = cols(
+    .default = col_guess(),
+    collision_index = col_character(),
+    collision_ref_no = col_character()
+  )
+)
+
+collisions_clean <- collisions_raw %>%
+  mutate(
+    collision_year = as.integer(collision_year),
+    collision_ref_join = str_pad(
+      collision_ref_no,
+      width = 9,
+      side = "left",
+      pad = "0"
+    ),
+    first_road_class = as.integer(first_road_class),
+    first_road_number = as.integer(first_road_number),
+    road_name = case_when(
+      first_road_class == 1 ~ paste0("M", first_road_number),
+      first_road_class == 2 ~ paste0("A", first_road_number, "(M)"),
+      first_road_class == 3 ~ paste0("A", first_road_number),
+      TRUE ~ NA_character_
+    ),
+    road_name = str_to_upper(road_name),
+    road_type = case_when(
+      str_detect(road_name, "^M") ~ "Motorway",
+      str_detect(road_name, "^A") ~ "A road",
+      TRUE ~ NA_character_
+    ),
+    severity_text = case_when(
+      collision_severity == 1 ~ "fatal",
+      collision_severity == 2 ~ "serious",
+      collision_severity == 3 ~ "slight",
+      TRUE ~ NA_character_
+    ),
+    severe = case_when(
+      collision_severity %in% c(1, 2) ~ 1,
+      collision_severity == 3 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    collision_hour = as.integer(substr(time, 1, 2)),
+    time_period = case_when(
+      collision_hour >= 7 & collision_hour <= 9 ~ "morning_peak",
+      collision_hour >= 10 & collision_hour <= 15 ~ "daytime",
+      collision_hour >= 16 & collision_hour <= 18 ~ "evening_peak",
+      !is.na(collision_hour) ~ "night_or_off_peak",
+      TRUE ~ NA_character_
+    ),
+    speed_group = case_when(
+      speed_limit <= 30 ~ "30 mph or below",
+      speed_limit >= 40 ~ "40 mph or above",
+      TRUE ~ NA_character_
+    ),
+    junction_group = case_when(
+      junction_detail == 0 ~ "No junction",
+      junction_detail == 13 ~ "T or staggered junction",
+      junction_detail %in% c(16, 17) ~ "Crossroads or larger junction",
+      junction_detail %in% c(18, 19, 99, -1) ~ "Other or unknown junction",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    collision_year %in% years,
+    police_force == 6,
+    road_type %in% c("Motorway", "A road"),
+    !is.na(road_name)
+  )
+
+write_csv(
+  collisions_clean,
+  file.path(clean_dir, "collisions_clean_gm_major_2017_2024.csv")
+)
+
+nrow(collisions_clean)
+
+rm(collisions_raw)
+invisible(gc())
+```
+
+```{r aggregate-collisions}
+collision_counts <- collisions_clean %>%
+  group_by(road_name, year = collision_year) %>%
+  summarise(
+    collision_count = n(),
+    fatal_count = sum(collision_severity == 1, na.rm = TRUE),
+    serious_count = sum(collision_severity == 2, na.rm = TRUE),
+    slight_count = sum(collision_severity == 3, na.rm = TRUE),
+    severe_count = sum(collision_severity %in% c(1, 2), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+frequency_model_data <- traffic_road_year %>%
+  left_join(collision_counts, by = c("road_name", "year")) %>%
+  mutate(
+    collision_count = replace_na(collision_count, 0),
+    fatal_count = replace_na(fatal_count, 0),
+    serious_count = replace_na(serious_count, 0),
+    slight_count = replace_na(slight_count, 0),
+    severe_count = replace_na(severe_count, 0)
+  )
+
+write_csv(
+  frequency_model_data,
+  file.path(clean_dir, "frequency_model_data_with_road_length.csv")
+)
+
+frequency_model_data %>%
+  summarise(
+    rows = n(),
+    total_collision_count = sum(collision_count),
+    missing_lgv_share = sum(is.na(lgv_share)),
+    missing_log_total_traffic = sum(is.na(log_total_traffic)),
+    missing_road_length = sum(is.na(road_length_km)),
+    missing_log_road_length = sum(is.na(log_road_length))
+  )
+
+rm(traffic_clean, road_length_data, traffic_road_year, collision_counts)
+invisible(gc())
+```
+
+```{r clean-vehicles}
+vehicles_raw <- read_csv(
+  vehicle_file,
+  col_select = c(
+    collision_index,
+    collision_ref_no,
+    collision_year,
+    vehicle_type,
+    age_of_driver
+  ),
+  col_types = cols(
+    collision_index = col_character(),
+    collision_ref_no = col_character(),
+    collision_year = col_integer(),
+    vehicle_type = col_integer(),
+    age_of_driver = col_double()
+  ),
+  num_threads = 1
+)
+
+vehicles_clean <- vehicles_raw %>%
+  mutate(
+    collision_year = as.integer(collision_year),
+    collision_ref_join = str_pad(
+      collision_ref_no,
+      width = 9,
+      side = "left",
+      pad = "0"
+    ),
+    vehicle_type = as.integer(vehicle_type),
+    age_of_driver = as.numeric(age_of_driver),
+    is_lgv = if_else(vehicle_type == 19, 1, 0),
+    young_driver = case_when(
+      age_of_driver >= 0 & age_of_driver < 25 ~ 1,
+      age_of_driver >= 25 ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(collision_year %in% years)
+
+vehicle_flags <- vehicles_clean %>%
+  group_by(collision_ref_join, collision_year) %>%
+  summarise(
+    lgv_involved = max(is_lgv, na.rm = TRUE),
+    young_driver_involved = if_else(
+      all(is.na(young_driver)),
+      NA_real_,
+      max(young_driver, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+write_csv(
+  vehicle_flags,
+  file.path(clean_dir, "vehicle_flags_lgv_young_driver.csv")
+)
+
+vehicle_flags %>%
+  summarise(
+    lgv_involved_collisions = sum(lgv_involved == 1, na.rm = TRUE),
+    young_driver_involved_collisions = sum(
+      young_driver_involved == 1,
+      na.rm = TRUE
+    )
+  )
+
+rm(vehicles_raw, vehicles_clean)
+invisible(gc())
+```
+
+```{r build-model-data}
+severity_joined_data <- collisions_clean %>%
+  left_join(vehicle_flags, by = c("collision_ref_join", "collision_year"))
+
+vehicle_match_check <- severity_joined_data %>%
+  summarise(
+    collision_observations = n(),
+    matched_lgv_flag = sum(!is.na(lgv_involved)),
+    matched_young_driver_flag = sum(!is.na(young_driver_involved)),
+    lgv_match_rate = mean(!is.na(lgv_involved)),
+    young_driver_match_rate = mean(!is.na(young_driver_involved))
+  )
+
+write_csv(
+  vehicle_match_check,
+  file.path(clean_dir, "collision_vehicle_match_check.csv")
+)
+
+vehicle_match_check
+
+severity_model_data <- severity_joined_data %>%
+  filter(
+    !is.na(severe),
+    !is.na(lgv_involved),
+    !is.na(young_driver_involved),
+    !is.na(time_period),
+    !is.na(speed_group),
+    !is.na(junction_group),
+    !is.na(road_type)
+  )
+
+write_csv(
+  severity_model_data,
+  file.path(clean_dir, "severity_model_data_with_controls.csv")
+)
+
+severity_model_data %>%
+  summarise(
+    rows = n(),
+    severe_collisions = sum(severe == 1),
+    slight_collisions = sum(severe == 0),
+    lgv_involved_collisions = sum(lgv_involved == 1),
+    young_driver_involved_collisions = sum(young_driver_involved == 1),
+    speed_groups = n_distinct(speed_group),
+    junction_groups = n_distinct(junction_group)
+  )
+```
+
+```{r check-severity-groups}
+severity_model_data %>%
+  count(speed_group, severe, name = "collisions") %>%
+  arrange(speed_group, severe)
+
+severity_model_data %>%
+  count(junction_group, name = "collisions") %>%
+  arrange(junction_group)
+```
+
+
+
+```{r prepare-analysis}
+frequency_file <- file.path(
+  clean_dir,
+  "frequency_model_data_with_road_length.csv"
+)
+severity_file <- file.path(
+  clean_dir,
+  "severity_model_data_with_controls.csv"
+)
+
+frequency_data <- read_csv(frequency_file, show_col_types = FALSE) %>%
+  mutate(
+    lgv_share_10pp = lgv_share * 10,
+    road_type = factor(road_type, levels = c("A road", "Motorway")),
+    year = factor(as.character(year), levels = as.character(years))
+  ) %>%
+  filter(
+    !is.na(collision_count),
+    !is.na(lgv_share_10pp),
+    !is.na(log_total_traffic),
+    !is.na(log_road_length),
+    !is.na(road_type),
+    !is.na(year),
+    !is.na(road_name)
+  )
+
+severity_data <- read_csv(severity_file, show_col_types = FALSE) %>%
+  mutate(
+    lgv_involved = factor(lgv_involved, levels = c(0, 1)),
+    young_driver_involved = factor(young_driver_involved, levels = c(0, 1)),
+    road_type = factor(road_type, levels = c("A road", "Motorway")),
+    time_period = factor(
+      time_period,
+      levels = c(
+        "morning_peak",
+        "daytime",
+        "evening_peak",
+        "night_or_off_peak"
+      )
+    ),
+    speed_group = case_when(
+      as.numeric(as.character(speed_limit)) <= 30 ~ "30 mph or below",
+      as.numeric(as.character(speed_limit)) >= 40 ~ "40 mph or above",
+      TRUE ~ NA_character_
+    ),
+    speed_group = factor(
+      speed_group,
+      levels = c("30 mph or below", "40 mph or above")
+    ),
+    junction_group = factor(
+      junction_group,
+      levels = c(
+        "No junction",
+        "T or staggered junction",
+        "Crossroads or larger junction",
+        "Other or unknown junction"
+      )
+    ),
+    collision_year = factor(
+      as.character(collision_year),
+      levels = as.character(years)
+    )
+  )
+
+sample_checks <- data.frame(
+  measure = c(
+    "Frequency model observations",
+    "Total collisions in frequency data",
+    "Severity model observations",
+    "Severe collisions in severity data",
+    "LGV-involved collisions in severity data"
+  ),
+  value = c(
+    nrow(frequency_data),
+    sum(frequency_data$collision_count, na.rm = TRUE),
+    nrow(severity_data),
+    sum(severity_data$severe == 1, na.rm = TRUE),
+    sum(severity_data$lgv_involved == 1, na.rm = TRUE)
+  )
+)
+
+write_csv(
+  sample_checks,
+  file.path(analysis_dir, "sample_checks_from_analysis.csv")
+)
+```
+
+```{r sample-summary}
+sample_checks
+```
+
+```{r frequency-statistics}
+frequency_overall <- frequency_data %>%
+  summarise(
+    observations = n(),
+    total_collisions = sum(collision_count, na.rm = TRUE),
+    mean_collision_count = mean(collision_count, na.rm = TRUE),
+    median_collision_count = median(collision_count, na.rm = TRUE),
+    sd_collision_count = sd(collision_count, na.rm = TRUE),
+    mean_lgv_share = mean(lgv_share, na.rm = TRUE),
+    median_lgv_share = median(lgv_share, na.rm = TRUE),
+    mean_total_traffic = mean(all_motor_vehicles, na.rm = TRUE),
+    mean_LGVs = mean(LGVs, na.rm = TRUE),
+    mean_road_length_km = mean(road_length_km, na.rm = TRUE)
+  )
+
+frequency_by_year <- frequency_data %>%
+  group_by(year) %>%
+  summarise(
+    observations = n(),
+    total_collisions = sum(collision_count, na.rm = TRUE),
+    mean_collision_count = mean(collision_count, na.rm = TRUE),
+    mean_lgv_share = mean(lgv_share, na.rm = TRUE),
+    mean_total_traffic = mean(all_motor_vehicles, na.rm = TRUE),
+    mean_LGVs = mean(LGVs, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+frequency_by_road_type <- frequency_data %>%
+  group_by(road_type) %>%
+  summarise(
+    observations = n(),
+    total_collisions = sum(collision_count, na.rm = TRUE),
+    mean_collision_count = mean(collision_count, na.rm = TRUE),
+    mean_lgv_share = mean(lgv_share, na.rm = TRUE),
+    mean_total_traffic = mean(all_motor_vehicles, na.rm = TRUE),
+    mean_road_length_km = mean(road_length_km, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  frequency_overall,
+  file.path(analysis_dir, "frequency_overall_descriptive_statistics.csv")
+)
+write_csv(
+  frequency_by_year,
+  file.path(analysis_dir, "frequency_descriptive_statistics_by_year.csv")
+)
+write_csv(
+  frequency_by_road_type,
+  file.path(analysis_dir, "frequency_descriptive_statistics_by_road_type.csv")
+)
+```
+
+```{r frequency-tables}
+frequency_overall
+frequency_by_year
+frequency_by_road_type
+```
+
+```{r severity-statistics}
+severity_overall <- severity_data %>%
+  summarise(
+    observations = n(),
+    severe_collisions = sum(severe == 1, na.rm = TRUE),
+    slight_collisions = sum(severe == 0, na.rm = TRUE),
+    severe_rate = mean(severe == 1, na.rm = TRUE),
+    lgv_involved_collisions = sum(lgv_involved == 1, na.rm = TRUE),
+    young_driver_involved_collisions = sum(
+      young_driver_involved == 1,
+      na.rm = TRUE
+    )
+  )
+
+severity_by_lgv <- severity_data %>%
+  group_by(lgv_involved) %>%
+  summarise(
+    observations = n(),
+    severe_collisions = sum(severe == 1, na.rm = TRUE),
+    slight_collisions = sum(severe == 0, na.rm = TRUE),
+    severe_rate = mean(severe == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+severity_by_time_period <- severity_data %>%
+  group_by(time_period) %>%
+  summarise(
+    observations = n(),
+    severe_collisions = sum(severe == 1, na.rm = TRUE),
+    severe_rate = mean(severe == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  severity_overall,
+  file.path(analysis_dir, "severity_overall_descriptive_statistics.csv")
+)
+write_csv(
+  severity_by_lgv,
+  file.path(analysis_dir, "severity_descriptive_statistics_by_lgv_involved.csv")
+)
+write_csv(
+  severity_by_time_period,
+  file.path(analysis_dir, "severity_descriptive_statistics_by_time_period.csv")
+)
+```
+
+```{r severity-tables}
+severity_overall
+severity_by_lgv
+severity_by_time_period
+```
+
+```{r prepare-trends}
+plot_year_summary <- frequency_data %>%
+  group_by(year) %>%
+  summarise(
+    total_collision_count = sum(collision_count, na.rm = TRUE),
+    mean_LGVs = mean(LGVs, na.rm = TRUE),
+    mean_lgv_share = mean(lgv_share, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(year_number = as.integer(as.character(year)))
+```
+
+```{r plot-collision-trend}
+fig_collision_trend <- ggplot(
+  plot_year_summary,
+  aes(x = year_number, y = total_collision_count)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = plot_year_summary$year_number) +
+  labs(
+    title = "Collision Frequency on Major Roads, 2017-2024",
+    x = "Year",
+    y = "Total collision count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(figure_dir, "collision_frequency_trend.png"),
+  fig_collision_trend,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+fig_collision_trend
+```
+
+```{r plot-lgv-flow-trend}
+fig_lgv_flow_trend <- ggplot(
+  plot_year_summary,
+  aes(x = year_number, y = mean_LGVs)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = plot_year_summary$year_number) +
+  labs(
+    title = "Mean LGVs Flow on Major Roads, 2017-2024",
+    x = "Year",
+    y = "Mean LGVs AADF"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(figure_dir, "lgv_flow_trend.png"),
+  fig_lgv_flow_trend,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+fig_lgv_flow_trend
+```
+
+```{r plot-lgv-share-trend}
+fig_lgv_share_trend <- ggplot(
+  plot_year_summary,
+  aes(x = year_number, y = mean_lgv_share)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = plot_year_summary$year_number) +
+  labs(
+    title = "Mean LGVs Share on Major Roads, 2017-2024",
+    x = "Year",
+    y = "Mean LGVs share"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(figure_dir, "lgv_share_trend.png"),
+  fig_lgv_share_trend,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+fig_lgv_share_trend
+```
+
+```{r plot-severity-trend}
+severity_by_year_plot <- severity_data %>%
+  count(collision_year, severity_text, name = "collision_count") %>%
+  mutate(
+    collision_year_number = as.integer(as.character(collision_year)),
+    severity_text = factor(
+      severity_text,
+      levels = c("fatal", "serious", "slight")
+    )
+  )
+
+fig_severity_by_year <- ggplot(
+  severity_by_year_plot,
+  aes(
+    x = factor(collision_year_number),
+    y = collision_count,
+    fill = severity_text
+  )
+) +
+  geom_col() +
+  labs(
+    title = "Collision Severity by Year",
+    x = "Year",
+    y = "Number of collisions",
+    fill = "Severity"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave(
+  file.path(figure_dir, "severity_by_year.png"),
+  fig_severity_by_year,
+  width = 7,
+  height = 5,
+  dpi = 300
+)
+
+fig_severity_by_year
+```
+
+```{r define-model-table}
+make_model_table <- function(
+  model,
+  cluster_variable,
+  model_name,
+  effect_label
+) {
+  robust_vcov <- vcovCL(
+    model,
+    cluster = cluster_variable,
+    type = "HC1"
+  )
+
+  estimate <- coef(model)
+  robust_se <- sqrt(diag(robust_vcov))
+  statistic <- estimate / robust_se
+  p_value <- 2 * pnorm(abs(statistic), lower.tail = FALSE)
+
+  data.frame(
+    model = model_name,
+    term = names(estimate),
+    estimate = as.numeric(estimate),
+    robust_std_error = as.numeric(robust_se),
+    statistic = as.numeric(statistic),
+    p_value = as.numeric(p_value),
+    exp_estimate = exp(as.numeric(estimate)),
+    exp_low_95 = exp(as.numeric(estimate) - 1.96 * robust_se),
+    exp_high_95 = exp(as.numeric(estimate) + 1.96 * robust_se),
+    effect_label = effect_label,
+    row.names = NULL
+  )
+}
+```
+
+```{r fit-frequency-model-one}
+frequency_model_1 <- glm.nb(
+  collision_count ~ lgv_share_10pp,
+  data = frequency_data
+)
+
+frequency_model_1_results <- make_model_table(
+  frequency_model_1,
+  frequency_data$road_name,
+  "Model 1: unadjusted collision frequency",
+  "IRR"
+)
+
+summary(frequency_model_1)
+frequency_model_1_results
+
+write_csv(
+  frequency_model_1_results,
+  file.path(analysis_dir, "model_1_unadjusted_frequency_results.csv")
+)
+```
+
+```{r fit-frequency-model-two}
+frequency_model_2 <- glm.nb(
+  collision_count ~
+    lgv_share_10pp +
+    log_total_traffic +
+    log_road_length +
+    road_type +
+    year,
+  data = frequency_data
+)
+
+frequency_model_2_results <- make_model_table(
+  frequency_model_2,
+  frequency_data$road_name,
+  "Model 2: adjusted collision frequency",
+  "IRR"
+)
+
+summary(frequency_model_2)
+frequency_model_2_results
+
+write_csv(
+  frequency_model_2_results,
+  file.path(analysis_dir, "model_2_adjusted_frequency_results.csv")
+)
+```
+
+```{r frequency-diagnostics}
+poisson_model_2 <- glm(
+  collision_count ~
+    lgv_share_10pp +
+    log_total_traffic +
+    log_road_length +
+    road_type +
+    year,
+  family = poisson(link = "log"),
+  data = frequency_data
+)
+
+overdispersion_ratio_model_2 <-
+  sum(residuals(poisson_model_2, type = "pearson")^2) /
+  df.residual(poisson_model_2)
+
+frequency_diagnostics <- data.frame(
+  model = c(
+    "Poisson version of Model 2",
+    "Negative Binomial Model 2"
+  ),
+  observations = c(nobs(poisson_model_2), nobs(frequency_model_2)),
+  AIC = c(AIC(poisson_model_2), AIC(frequency_model_2)),
+  pearson_overdispersion_ratio = c(
+    overdispersion_ratio_model_2,
+    NA_real_
+  ),
+  NB_theta = c(NA_real_, frequency_model_2$theta)
+)
+
+frequency_model_comparison <- bind_rows(
+  frequency_model_1_results,
+  frequency_model_2_results
+) %>%
+  filter(term == "lgv_share_10pp") %>%
+  dplyr::select(
+    model,
+    term,
+    estimate,
+    robust_std_error,
+    exp_estimate,
+    exp_low_95,
+    exp_high_95,
+    p_value,
+    effect_label
+  )
+
+frequency_diagnostics
+frequency_model_comparison
+
+write_csv(
+  frequency_diagnostics,
+  file.path(analysis_dir, "frequency_model_diagnostics.csv")
+)
+write_csv(
+  frequency_model_comparison,
+  file.path(analysis_dir, "model_1_vs_model_2_lgv_share_comparison.csv")
+)
+```
+
+```{r fit-severity-model}
+severity_model <- glm(
+  severe ~
+    lgv_involved +
+    young_driver_involved +
+    time_period +
+    factor(speed_group) +
+    factor(junction_group) +
+    factor(road_type) +
+    factor(collision_year),
+  family = binomial(link = "logit"),
+  data = severity_data
+)
+
+severity_model_results <- make_model_table(
+  severity_model,
+  severity_data$road_name,
+  "Model 3: collision severity model",
+  "OR"
+)
+
+summary(severity_model)
+severity_model_results
+
+write_csv(
+  severity_model_results,
+  file.path(analysis_dir, "model_3_collision_severity_results.csv")
+)
+```
+
+```{r compile-model-summary}
+model_fit_summary <- data.frame(
+  model = c(
+    "Model 1: unadjusted collision frequency",
+    "Model 2: adjusted collision frequency",
+    "Model 3: collision severity model"
+  ),
+  model_type = c(
+    "Negative binomial",
+    "Negative binomial",
+    "Binary logistic regression"
+  ),
+  observations = c(
+    nobs(frequency_model_1),
+    nobs(frequency_model_2),
+    nobs(severity_model)
+  ),
+  AIC = c(
+    AIC(frequency_model_1),
+    AIC(frequency_model_2),
+    AIC(severity_model)
+  )
+)
+
+key_results <- bind_rows(
+  frequency_model_1_results,
+  frequency_model_2_results,
+  severity_model_results
+) %>%
+  filter(
+    term %in% c(
+      "lgv_share_10pp",
+      "lgv_involved1",
+      "young_driver_involved1"
+    )
+  )
+
+model_fit_summary
+key_results
+
+write_csv(
+  model_fit_summary,
+  file.path(analysis_dir, "model_fit_summary.csv")
+)
+write_csv(
+  key_results,
+  file.path(analysis_dir, "key_model_results.csv")
+)
+```
